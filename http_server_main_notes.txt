@@ -1,0 +1,97 @@
+http_server_main_notes
+
+IPv4 supports 2**32 adresses unlike 
+newer ipv6 supporting 2**128
+SOCK_STREAM is used for TCP connections, while SOCK_DGRAM is used for UDP connections.
+
+client sends request to server, that's SYN  (synchronize)(knock on the door)  
+server responds, that's SYN-ACK (synchronise acknowledge) (you acknowledge the knock on the door)
+Client Says Hi, that's ACK (acknowledge)(they say hi to the server)
+
+if u use SOCK_DGRAM, it specifies u want to use the UDP Protocol, 
+this transfers the packets to the reciever, without verifying if the the recipient even wants to receive them
+basically, no handshake process.
+
+each website can be accessed vcia an IP address like 142.250.189.206 for google
+through DNS 
+
+in QUIC connection types, it is more secure as it supports encryption, especially in https and also adds an additonal handshake process
+when a user switches from wifi to their 4G connection, TCP and UDP connections need 
+to be re-established, not QUIC
+since QUIC identifies connections via connection IDs, not IP addresses
+
+for cutsomising the beahviour of our socket, we used socket_of_my_server.setsockopt<set socket options>(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+# protocol level for which the configuration is happening
+for socket level options, we use SOL_SOCKET
+for UDP??
+for TCP we use socket.IPPROTO_TCP
+
+socket.SO_REUSEADDR, re use address
+this is the optname, option name or the functionality we want to add, 
+usually, right after connection, there is a TIME_WAIT in the socket, to ensure 100% file delivery, which can cause "server already in use" error if u instantly refresh or close, or some else tries to connect to the same port/socket. this is problematic, so we want the server to be instantly reusable.
+
+1)
+simply is the value saying ON/OFF
+
+0.0.0.0 #makes it accessible through anyone using my LAN, do 127.0.1.1 to restrict access to this computer only
+
+1600 is the port number, 80 is for http and 443 is for https, 0-1023 are rreserved for OS use, so don't use those
+
+listen() (5) defines the number of connections in queue waiting to access the server,
+if the queue is full ,the OS of server computer may decline/ignore the extra requests.
+
+btw AF_NET, SOCK_STREAM are all constants
+
+accept returns the client's socket and IP Address in a tuple form so we will save that in two vars
+
+blocking and non-blocking explained in code
+
+
+while True:
+    try:
+        client_socket, client_address = my_server_socket.accept() # accepts the client's socket and IP address
+        print(client_socket)
+        print(client_address)
+    except:
+        time.sleep(0.5)
+        continue
+''' what this block essentially does is 
+first forget while
+we try to accept the client's request, if it works, meaning a client is in the connection queue
+great we capture the details and print them
+otherwise we wait .5 seconds and then continue the while loop.
+this allows for multi-user functionality and for the program to be up and running forever(or atleast until we pull the plug)
+'''
+final version in code itself, cus we don't need the try except, it was for understanding purposes, we can just do while loop
+
+refer to prototype 2 now
+
+clinet_socket.recv(1500).decode() recieves the request from client stores it in 1500 bytes, max is like 1600 smth
+then decodes it into string format
+
+all http are request lines
+first line is 3 elements, 
+1. method (GET here) 
+get tells server to fetch some request
+post is to create data in the server and push it
+update and delete does what bthe name suggests
+head is similar to get but responds only with the heads not the body
+(this is helpful in large downloads to save time as u can just check the header and its file size)
+options which tells the server to list all the options it has available for the client
+2. path, for local servers it is / 
+to understand this look at it like http://www.abc.xyz:1600/whateverpage/search?docid=69
+
+we know www.abc.xyz is replaced by the server IP address via DNS and after port comes the path
+
+hence, / is just saying http://0.0.0.0:1600/    which is technically your homepage
+
+3. is the http version used to get the request\
+
+next line is Host, domain name or local host
+then we have connection, keep-alive or close which tells the server that the client wants to keep the connection alive or not after this request is fulfilled
+
+we also have user-agent: which provides detailed info about client's browser, os, render engine etc
+
+also see: Accept: which tells the server all the formats the client can process priority left to right, with q denoting the quality factor
+
+
