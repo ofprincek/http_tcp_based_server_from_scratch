@@ -1,138 +1,170 @@
-# http_server — from-scratch TCP/HTTP server in Python
+# http-tcp-based-server-from-scratch
 
-this readme was derived from my notes in the repository itself using claude.ai
+A minimal HTTP server built directly on top of raw TCP sockets — no Flask, no Express, no `http.server`. Every layer that a framework normally hides — parsing the request line, routing, building a spec-compliant response, handling concurrent clients — is written and understood by hand.
 
-A minimal HTTP server built directly on top of raw TCP sockets — no `http.server`,
-no frameworks. Built to understand what's actually happening underneath a web
-framework: sockets, the TCP handshake, and manual HTTP parsing.
+This project exists to learn what's actually happening under an HTTP framework, not to ship something production-ready.
 
-## Concepts
+![Homepage preview](assets/homepage-preview.png)
 
-### IP addresses
-- IPv4 supports `2**32` addresses. IPv6 supports `2**128`.
-- Every reachable host has an IP (e.g. `142.250.189.206` for Google). DNS maps
-  human-readable domains to these addresses.
+---
 
-### TCP vs UDP
-- `socket.SOCK_STREAM` → TCP. `socket.SOCK_DGRAM` → UDP.
-- TCP establishes a connection first via the **three-way handshake**:
-  1. **SYN** — client requests a connection ("knock on the door")
-  2. **SYN-ACK** — server acknowledges and responds ("acknowledges the knock")
-  3. **ACK** — client acknowledges back ("says hi")
-- UDP sends packets with no handshake and no delivery guarantee — faster, but
-  the sender never confirms the receiver got (or wanted) anything.
-- **QUIC** (used in HTTP/3) improves on both: it's encrypted by default, adds
-  its own handshake, and identifies connections by a **connection ID** rather
-  than IP address — so switching networks (e.g. Wi-Fi → mobile data) doesn't
-  force a new connection the way it does with plain TCP/UDP.
+## What this is
 
-### Sockets
-- `AF_INET`, `SOCK_STREAM` are constants identifying the address family
-  (IPv4) and socket type (TCP stream).
-- `setsockopt(level, optname, value)` configures socket behavior:
-  - `level` — which protocol layer the option applies to. Most general socket
-    options (like `SO_REUSEADDR`) live at `SOL_SOCKET`, the layer above any
-    specific protocol. TCP-specific options (e.g. `TCP_NODELAY`) instead use
-    `IPPROTO_TCP` as the level. `SO_REUSEADDR` is `SOL_SOCKET` regardless of
-    whether the underlying socket is TCP or UDP — it's not protocol-specific.
-  - `optname` — the specific option, e.g. `SO_REUSEADDR`.
-  - `value` — `1` = on, `0` = off.
-- **Why `SO_REUSEADDR` matters:** after a socket closes, the OS holds it in a
-  `TIME_WAIT` state briefly to guarantee any in-flight data is fully
-  delivered. Without `SO_REUSEADDR`, restarting the server immediately during
-  this window throws "address already in use." Setting it lets the socket be
-  reused right away.
-- **Host binding:**
-  - `0.0.0.0` — accept connections from anyone on the LAN.
-  - `127.0.0.1` — restrict to this machine only.
-- **Port choice:** 80 = HTTP, 443 = HTTPS. Ports 0–1023 are OS-reserved —
-  avoid binding to those directly.
-- `listen(n)` sets the backlog — how many pending connections can queue
-  before the OS starts declining/ignoring new ones.
-- `accept()` blocks until a client connects, then returns `(client_socket,
-  client_address)`.
+- A TCP server (`socket` module) that speaks just enough HTTP/1.1 to serve a couple of pages
+- One Python thread spun up per incoming connection, so a slow client can't freeze the whole server
+- A per-connection socket timeout, specifically to guard against Slowloris-style stalls
+- Dict-based routing (`path -> handler function`) instead of an if/elif chain
+- Two hand-styled HTML pages served from disk
 
-### Blocking vs non-blocking (proto1)
-By default, `accept()` **blocks** — the loop stops there until a client
-connects. `proto1` set `setblocking(False)` to experiment with non-blocking
-mode, which raises an exception immediately if no client is waiting instead
-of pausing execution:
+## What this is *not*
+
+- Not HTTPS/TLS-capable — it only speaks plaintext HTTP. Hitting it with `https://` will crash the decode step, because a TLS handshake is binary, not text (see [Known limitations](#known-limitations)).
+- Not built for large or streamed request bodies — `recv()` is called once per request with a fixed buffer size.
+- Not persistent-connection aware — every response closes the socket rather than reusing it (`Connection: keep-alive` is not implemented).
+
+---
+
+## Running it
+
+```bash
+python3 RUN_THIS_server_final.py
+```
+
+Update the hardcoded file paths in `site_homepage()` and `site_about()` to point at wherever you've cloned `homepage.html` and `about.html` on your own machine.
+
+Then hit it with:
+
+```
+http://localhost:9000/
+http://localhost:9000/about
+```
+
+Note the `http://`, not `https://` — see [Known limitations](#known-limitations).
+
+---
+
+## How it works
+
+### 1. Socket setup
+
+```python
+my_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+my_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+my_server_socket.bind((HOST, PORT))
+my_server_socket.listen(100)
+```
+
+- `AF_INET` + `SOCK_STREAM` → IPv4 over TCP.
+- `SO_REUSEADDR` lets the server rebind the same port immediately after a restart, instead of waiting out the OS's `TIME_WAIT` cooldown.
+- `listen(100)` sets the size of the **backlog queue** — how many fully-handshaken-but-not-yet-`accept()`-ed connections the OS will hold at once. It is *not* a cap on total concurrent clients; once a connection is `accept()`-ed it leaves this queue entirely and is tracked independently.
+
+### 2. Accepting clients — one thread each
 
 ```python
 while True:
-    try:
-        client_socket, client_address = my_server_socket.accept()
-        print(client_socket)
-        print(client_address)
-    except:
-        time.sleep(0.5)
-        continue
+    client_socket, client_address = my_server_socket.accept()
+    thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
+    thread.start()
 ```
 
-This busy-polls: try to accept, and if nothing's there yet, sleep briefly and
-retry. It keeps the loop alive indefinitely without crashing on an empty
-queue. Note this by itself doesn't add concurrent multi-client handling —
-each accepted connection is still processed one at a time; it just means the
-server doesn't hang/die waiting on `accept()`. **proto2 drops this** and goes
-back to plain blocking `accept()`, since the try/except was for
-understanding the mechanism, not something the final version needs.
+`accept()` blocks until a client connects, then hands back a socket dedicated to that one client. Rather than handling requests one at a time, each client is handed off to its own thread via `handle_client`.
 
-### Parsing the HTTP request (proto2)
-`client_socket.recv(1500).decode()` reads up to 1500 bytes off the socket and
-decodes it to a string — this is the raw HTTP request text.
+`.join()` is deliberately **not** called here. `.join()` blocks the calling code until the thread finishes — calling it right after `.start()` would force the main loop to wait for client A to fully finish before it could even `accept()` client B, defeating the entire purpose of threading. Skipping it lets `.start()` fire the thread and immediately return control to the loop, so the next `accept()` can happen right away while earlier clients are still being served in the background.
 
-A request's first line ("request line") has three space-separated parts:
-
-1. **Method** — `GET` (fetch a resource), `POST` (create/submit data),
-   `PUT`/`DELETE` (update/remove), `HEAD` (like GET but headers only, no
-   body — useful for checking a large file's size before downloading),
-   `OPTIONS` (ask the server what methods/options it supports).
-2. **Path** — e.g. `/` or `/search?docid=69`. In a full URL like
-   `http://www.abc.xyz:1600/whateverpage/search?docid=69`, DNS resolves
-   `www.abc.xyz` to an IP, the port follows the `:`, and everything after
-   that is the path. So plain `/` just means the site root —
-   `http://0.0.0.0:1600/`.
-3. **HTTP version** — e.g. `HTTP/1.1`.
-
-Subsequent lines are headers, e.g.:
-- `Host:` — the domain/localhost being requested.
-- `Connection: keep-alive` / `close` — whether the client wants the TCP
-  connection kept open after this request.
-- `User-Agent:` — client's browser/OS/rendering engine details.
-- `Accept:` — content types the client can handle, ordered by preference,
-  with an optional `q=` quality weight per type.
-
-## Building the response
-
-HTTP responses need `\r\n` (CRLF) line endings, not just `\n` — this is part
-of the HTTP spec, not a style choice. `nano`/`print()` debugging won't catch
-this because you're eyeballing raw output rather than parsing it strictly,
-but real HTTP clients (Thunder Client, browsers, curl) do parse strictly and
-will throw a parse error like `Missing expected CR after response line` if
-the CR is missing:
+### 3. Parsing the request
 
 ```python
-response = 'HTTP/1.1 200 OK\r\n\r\n' + content
+client_request = client_socket.recv(1500).decode(errors='ignore')
+client_request_headers = client_request.split('\n')
+first_line = client_request_headers[0]
+
+first_header_components = first_line.split()
+http_request = first_header_components[0]   # e.g. "GET"
+url_request  = first_header_components[1]   # e.g. "/about"
 ```
 
-The blank line (`\r\n\r\n`) separates headers from the body — proto2 doesn't
-send any headers yet, just status line + blank line + body.
+`recv(1500)` reads up to 1500 bytes currently available on the socket — TCP is a byte stream with no built-in concept of "one request," so this number is just a buffer size choice, not a protocol limit. It does **not** guarantee the entire request arrived in one call; a request with a large body or many headers could be split across multiple `recv()`s. Handling that properly would mean looping `recv()` until `\r\n\r\n` (end of headers) is seen, then reading `Content-Length` more bytes for the body — not yet implemented here.
 
-## Files
+`errors='ignore'` on decode matters specifically because non-GET requests (or a client attempting TLS against this plaintext server) can contain raw binary bytes that aren't valid UTF-8. Since only the plain-ASCII request line is actually read, tolerating undecodable bytes elsewhere avoids crashing the thread outright.
 
-| File | Purpose |
-|---|---|
-| `tcp_server_proto_1.py` | Blocking vs. non-blocking `accept()` experiment |
-| `tcp_server_proto_2.py` | Working server: parses GET requests, serves `index.html`, returns proper `\r\n` line endings |
-| `index.html` | Served on `GET /` |
+### 4. Routing — a dict instead of if/elif
 
-## Known gaps / next steps
-- Only `/` is routed — any other GET path currently falls through to the
-  same block with no dedicated 404-for-missing-file handling (only
-  method-level 404 exists, for non-GET verbs).
-- No concurrency — each client is accepted and handled fully before the next
-  `accept()` call runs (no threading yet).
-- File path in `open()` is relative to the process's working directory, not
-  the script's location — moving the launch directory breaks it silently.
-  Consider `os.path.dirname(os.path.abspath(__file__))` for a stable path.
-- No `Content-Type` or `Content-Length` headers sent yet.
+```python
+def site_homepage():
+    with open("/path/to/homepage.html") as homepage:
+        content = homepage.read()
+    return 'HTTP/1.1 200 OK\r\n\r\n' + content
+
+def site_about():
+    with open("/path/to/about.html") as about:
+        content = about.read()
+    return 'HTTP/1.1 200 OK\r\n\r\n' + content
+
+def url_not_found():
+    content = "URL not found, under construction.."
+    return 'HTTP/1.1 404 NOT FOUND\r\n\r\n' + content
+
+index = {
+    '/': site_homepage,
+    '/about': site_about,
+}
+
+handler = index.get(url_request, url_not_found)
+response = handler()
+```
+
+Dictionary values here are **references to functions**, not calls to them — notice `site_homepage`, no parentheses, when building `index`. `index.get(url_request, url_not_found)` looks up the requested path; if it's not a key in the dict, it falls back to `url_not_found` instead of raising a `KeyError`. Only once `handler` is resolved does `handler()` actually call it and produce the response string. This is conceptually the same mechanism frameworks like Flask use under the hood for `@app.route(...)`, just without the decorator syntax.
+
+This only matches exact static paths — no `/users/42`-style dynamic segments or wildcards. That would need pattern matching (regex or a real router) layered on top.
+
+### 5. CRLF — why every response needs `\r\n\r\n`
+
+HTTP/1.1 (RFC 7230) requires `\r\n` (carriage return + line feed) as the line terminator for the status line, every header, and the blank line separating headers from the body — not just `\n`. Some clients tolerate a bare `\n`, but stricter parsers (Thunder Client, for one) will reject it outright with a parse error. `\r` and `\n` are separate, historically distinct characters (carriage return vs. line feed, from typewriter conventions) that Unix collapsed into just `\n` for text files — HTTP never made that simplification, so both are required, always, in a hand-built response.
+
+The status line itself also needs a **status code and reason phrase**, not just the version — `HTTP/1.1 200 OK`, not `HTTP/1.1`. Interestingly, the reason phrase's casing (`OK` vs `ok`) isn't actually mandated by the HTTP spec itself; it's decorative text a well-behaved client shouldn't rely on. Some parsers are stricter than the spec requires anyway, which is why case mismatches can still break things in practice even though they're spec-legal.
+
+### 6. Timeout and error handling
+
+```python
+def handle_client(client_socket, client_address):
+    try:
+        client_socket.settimeout(5)
+        # ... parse request, build response, sendall ...
+    except socket.timeout:
+        print(f"client : {client_address} timed out, dropping connection..")
+    except Exception as e:
+        print(f"Error handling client {client_address}, due to {e}")
+    finally:
+        client_socket.close()
+```
+
+`settimeout(5)` bounds how long any single client can leave `recv()` blocking with no data — without it, a client that connects and never sends anything (or sends data extremely slowly) would hang that thread forever. This is the specific defense against **Slowloris**, a real attack that targets single-threaded, no-timeout servers by opening many connections and trickling data just slowly enough to exhaust available threads/resources.
+
+`finally: client_socket.close()` always runs — success, timeout, or unexpected crash — so sockets are never silently leaked. Closing the socket at the end also doubles as this server's *end-of-response signal*: since responses don't send a `Content-Length` header, the client has no way to know the response is complete other than the connection actually closing.
+
+---
+
+## Known limitations
+
+- **No HTTPS support.** This server only understands plaintext HTTP. Sending an `https://` request to it causes a decode crash — a TLS handshake is an encrypted binary negotiation, not text, so trying to `.decode()` it as UTF-8 fails immediately. To serve HTTPS for real, TLS needs to be terminated somewhere: either wrapping the socket with Python's `ssl` module, or (far more common in production) placing a reverse proxy like nginx in front that handles TLS and forwards plain HTTP to this server.
+- **No `Content-Length` / keep-alive.** Every response closes the connection rather than reusing it, so each request pays for a fresh TCP handshake. Implementing keep-alive would mean sending `Content-Length`, looping on the same socket for further requests, and adding an idle timeout for genuinely inactive-but-open connections.
+- **`recv(1500)` is a single call, not a loop.** Large requests (big POST bodies, many headers) can arrive split across multiple TCP packets and simply get truncated at 1500 bytes as written.
+- **Only exact static path matching.** No dynamic segments, no wildcards, no query string parsing.
+
+---
+
+## Roadmap / next steps
+
+- [ ] Buffered `recv()` loop: read until `\r\n\r\n`, then read `Content-Length` more bytes for the body
+- [ ] Proper `Content-Length` header on responses + basic keep-alive
+- [ ] POST body handling
+- [ ] Dynamic route matching (`/users/<id>`-style)
+- [ ] TLS termination (via `ssl` module or a reverse proxy)
+- [ ] Move from thread-per-connection to async I/O (`asyncio`) for better scaling
+
+---
+
+## Author
+
+Built by [@ofprincek](https://github.com/ofprincek) as a from-scratch deep-dive into what HTTP servers actually do under the framework layer. project summary via claude.ai
+please consult my notes in the repo for my personal insights and notes, see also: in-code comments. Thank u!!
