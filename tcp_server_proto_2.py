@@ -31,7 +31,7 @@ while True:
     request_path=first_header_components[1]
     if http_request=="GET":
         if request_path == '/' :
-            with open("http_server/index.html") as indx: # please modify the filepath here, based on your terminal.
+            with open("/home/ofprincek/github/http_tcp_based_server_from_scratch/index.html") as indx: # please modify the filepath here, based on your terminal.
                 content=indx.read()
                 indx.close()
     
